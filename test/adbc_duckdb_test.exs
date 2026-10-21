@@ -289,4 +289,18 @@ defmodule Adbc.DuckDBTest do
 
     assert map["iv_col"] == [{14, 3, 1_000_000_000}, {0, 0, 0}, nil]
   end
+
+  test "a reader killed mid-stream releases the connection at once", %{conn: conn} do
+    for _round <- 1..10 do
+      reader =
+        spawn(fn -> Connection.query(conn, "SELECT range AS x FROM range(500000000)") end)
+
+      Process.sleep(Enum.random(50..300))
+      Process.exit(reader, :kill)
+
+      {micros, result} = :timer.tc(fn -> Connection.query!(conn, "SELECT 1 AS y") end)
+      assert Adbc.Result.to_map(result) == %{"y" => [1]}
+      assert micros < 2_000_000
+    end
+  end
 end

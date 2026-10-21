@@ -2,6 +2,7 @@
 #include <cstdbool>
 #include <cstdio>
 #include <fine.hpp>
+#include <mutex>
 #include <nanoarrow/nanoarrow.h>
 #include <nanoarrow/nanoarrow_ipc.h>
 #include <nanoarrow/nanoarrow_ipc.hpp>
@@ -54,6 +55,10 @@ struct ArrowArrayStreamResource {
   nanoarrow::UniqueSchema schema;
   // Keeps the statement alive while reading.
   fine::ResourcePtr<AdbcStatementResource> statement;
+  // Serializes reads against release. The process reading a stream may be
+  // killed while it is inside a dirty NIF, and the connection then releases
+  // the stream from another scheduler while the read is still running.
+  std::mutex mutex;
 };
 FINE_RESOURCE(ArrowArrayStreamResource);
 
@@ -267,6 +272,18 @@ adbc_connection_set_option(ErlNifEnv *env,
       AdbcConnectionSetOptionDouble);
 }
 FINE_NIF(adbc_connection_set_option, 0);
+
+AdbcResult<>
+adbc_connection_cancel(ErlNifEnv *env,
+                       fine::ResourcePtr<AdbcConnectionResource> conn) {
+  struct AdbcError adbc_error{};
+  auto code = AdbcConnectionCancel(&conn->value, &adbc_error);
+  if (code != ADBC_STATUS_OK) {
+    return fine::Error(ExAdbcError(&adbc_error));
+  }
+  return fine::Ok<>();
+}
+FINE_NIF(adbc_connection_cancel, ERL_NIF_DIRTY_JOB_IO_BOUND);
 
 AdbcResult<>
 adbc_connection_init(ErlNifEnv *env,
@@ -504,6 +521,11 @@ adbc_arrow_array_stream_next(ErlNifEnv *env,
                              fine::ResourcePtr<ArrowArrayStreamResource> res) {
   nanoarrow::UniqueArray array;
   fine::Term out_term;
+  std::lock_guard<std::mutex> lock(res->mutex);
+
+  if (res->stream->release == nullptr) {
+    return fine::Error(ExArgumentError("arrow array stream has been released"));
+  }
 
   if (res->stream->get_next == nullptr) {
     return fine::Error(ExArgumentError("invalid arrow array stream"));
@@ -545,6 +567,7 @@ FINE_NIF(adbc_arrow_array_stream_next, ERL_NIF_DIRTY_JOB_IO_BOUND);
 
 fine::Ok<> adbc_arrow_array_stream_release(
     ErlNifEnv *env, fine::ResourcePtr<ArrowArrayStreamResource> res) {
+  std::lock_guard<std::mutex> lock(res->mutex);
   res->stream.reset();
   return fine::Ok<>();
 }
@@ -591,6 +614,8 @@ FINE_NIF(adbc_ipc_load_stream_binary, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 AdbcResult<std::string>
 adbc_ipc_dump_stream_ref(ErlNifEnv *env,
                          fine::ResourcePtr<ArrowArrayStreamResource> res) {
+  std::lock_guard<std::mutex> lock(res->mutex);
+
   if (res->stream->release == nullptr) {
     return fine::Error(ExArgumentError("stream has already been consumed"));
   }

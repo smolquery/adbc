@@ -931,6 +931,10 @@ defmodule Adbc.Connection do
 
   @impl true
   def handle_info({:DOWN, ref, _, _, _}, %{lock: {ref, stream_ref}} = state) do
+    # The reader may have been killed inside a read that is still running
+    # on a dirty scheduler. The release waits for that read, so cancel the
+    # query first to make the read return now rather than at its end.
+    Adbc.Nif.adbc_connection_cancel(state.conn)
     Adbc.Nif.adbc_arrow_array_stream_release(stream_ref)
     {:noreply, maybe_dequeue(%{state | lock: :none})}
   end

@@ -29,6 +29,8 @@ defmodule Adbc.Nif do
 
   def adbc_connection_init(_self, _database), do: :erlang.nif_error(:not_loaded)
 
+  def adbc_connection_cancel(_self), do: :erlang.nif_error(:not_loaded)
+
   def adbc_connection_get_info(_self, _info_codes), do: :erlang.nif_error(:not_loaded)
 
   def adbc_connection_get_objects(
