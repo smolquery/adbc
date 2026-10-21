@@ -35,5 +35,3 @@ adbc-*.tar
 3rd_party/cache
 arrow-nanoarrow/
 
-# checksum
-checksum.exs

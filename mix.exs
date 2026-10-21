@@ -7,8 +7,8 @@
 defmodule Adbc.MixProject do
   use Mix.Project
 
-  @version "0.12.2-dev"
-  @github_url "https://github.com/elixir-explorer/adbc"
+  @version "0.12.2-smolquery.1"
+  @github_url "https://github.com/smolquery/adbc"
 
   def project do
     [
