@@ -8,6 +8,11 @@ defmodule Adbc.Connection do
 
   @type t :: GenServer.server()
 
+  @typedoc """
+  A handle that cancels what a connection is running. See `cancel_handle/1`.
+  """
+  @opaque cancel_handle :: reference()
+
   use GenServer
   import Adbc.Helper, only: [error_to_exception: 1]
 
@@ -55,6 +60,36 @@ defmodule Adbc.Connection do
          :ok <- init_options(conn, opts) do
       GenServer.start_link(__MODULE__, {db, conn}, process_options)
     else
+      {:error, reason} -> {:error, error_to_exception(reason)}
+    end
+  end
+
+  @doc """
+  Returns a handle that cancels what the connection is running.
+
+  The connection process executes statements itself, so a message asking it
+  to cancel would wait behind the statement it means to stop. Ask for the
+  handle while the connection is idle, keep it, and give it to `cancel/1`
+  when needed: the cancel then reaches the driver directly, from any process,
+  while the connection process is busy or after it has died.
+
+  The handle keeps the driver's connection alive for as long as it is
+  referenced.
+  """
+  @spec cancel_handle(t()) :: cancel_handle()
+  def cancel_handle(conn), do: GenServer.call(conn, :cancel_handle, :infinity)
+
+  @doc """
+  Cancels what the connection behind `handle` is running.
+
+  A statement executing, or a stream being read, fails with the driver's
+  cancellation error. A connection running nothing is left as it is. See
+  `cancel_handle/1`.
+  """
+  @spec cancel(cancel_handle()) :: :ok | {:error, Exception.t()}
+  def cancel(handle) when is_reference(handle) do
+    case Adbc.Nif.adbc_connection_cancel(handle) do
+      :ok -> :ok
       {:error, reason} -> {:error, error_to_exception(reason)}
     end
   end
@@ -923,6 +958,10 @@ defmodule Adbc.Connection do
 
   def handle_call({:option, func, args}, _from, state = %{conn: conn}) do
     {:reply, Adbc.Helper.option(conn, func, args), state}
+  end
+
+  def handle_call(:cancel_handle, _from, state = %{conn: conn}) do
+    {:reply, conn, state}
   end
 
   @impl true

@@ -303,4 +303,40 @@ defmodule Adbc.DuckDBTest do
       assert micros < 2_000_000
     end
   end
+
+  describe "cancel/1" do
+    @slow "SELECT max(a.range * b.range) FROM range(100000) a, range(100000) b"
+
+    test "fails the query the connection is running", %{conn: conn} do
+      handle = Connection.cancel_handle(conn)
+      reader = Task.async(fn -> Connection.query(conn, @slow) end)
+
+      assert {:error, error} = cancel_until_done(handle, reader)
+      assert Exception.message(error) =~ "nterrupt"
+      assert Adbc.Result.to_map(Connection.query!(conn, "SELECT 1 AS y")) == %{"y" => [1]}
+    end
+
+    test "leaves an idle connection as it is", %{conn: conn} do
+      assert :ok = Connection.cancel(Connection.cancel_handle(conn))
+      assert Adbc.Result.to_map(Connection.query!(conn, "SELECT 1 AS y")) == %{"y" => [1]}
+    end
+
+    test "reaches the driver after the connection process died", %{db: db} do
+      {:ok, conn} = Connection.start_link(database: db)
+      Process.unlink(conn)
+      handle = Connection.cancel_handle(conn)
+      Process.exit(conn, :kill)
+
+      assert :ok = Connection.cancel(handle)
+    end
+
+    defp cancel_until_done(handle, task) do
+      :ok = Connection.cancel(handle)
+
+      case Task.yield(task, 100) do
+        {:ok, result} -> result
+        nil -> cancel_until_done(handle, task)
+      end
+    end
+  end
 end
