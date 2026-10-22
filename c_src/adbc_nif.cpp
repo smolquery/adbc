@@ -51,10 +51,12 @@ struct AdbcStatementResource {
 FINE_RESOURCE(AdbcStatementResource);
 
 struct ArrowArrayStreamResource {
+  // Keeps the statement alive while reading. Declared first so that it is
+  // destroyed last: members are destroyed in reverse order, and the stream
+  // must be released while the statement and its connection still exist.
+  fine::ResourcePtr<AdbcStatementResource> statement;
   nanoarrow::UniqueArrayStream stream;
   nanoarrow::UniqueSchema schema;
-  // Keeps the statement alive while reading.
-  fine::ResourcePtr<AdbcStatementResource> statement;
   // Serializes reads against release. The process reading a stream may be
   // killed while it is inside a dirty NIF, and the connection then releases
   // the stream from another scheduler while the read is still running.

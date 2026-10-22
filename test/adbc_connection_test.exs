@@ -559,6 +559,35 @@ defmodule Adbc.ConnectionTest do
       run_anything(conn)
     end
 
+    test "the stream outlives a killed connection while the callback runs", %{db: db} do
+      {:ok, conn} = Connection.start_link(database: db)
+      Process.unlink(conn)
+      parent = self()
+
+      reader =
+        spawn(fn ->
+          Connection.query_pointer(conn, "SELECT 123 AS num", fn
+            %Adbc.StreamResult{pointer: pointer} ->
+              send(parent, :reading)
+
+              receive do
+                :read ->
+                  {:ok, stream} = Adbc.Nif.adbc_arrow_array_stream_from_pointer(pointer)
+                  send(parent, {:read, Adbc.Nif.adbc_arrow_array_stream_next(stream)})
+              end
+          end)
+        end)
+
+      assert_receive :reading
+      monitor = Process.monitor(conn)
+      Process.exit(conn, :kill)
+      assert_receive {:DOWN, ^monitor, _, _, _}
+      :erlang.garbage_collect(reader)
+      send(reader, :read)
+
+      assert_receive {:read, {:ok, [%Adbc.Column{field: %Adbc.Field{name: "num"}}]}}
+    end
+
     test "commands that error do not lock", %{db: db} do
       conn = start_supervised!({Connection, database: db})
       {:error, %Adbc.Error{}} = Connection.query(conn, "NOT VALID SQL")

@@ -860,10 +860,16 @@ defmodule Adbc.Connection do
   defp stream(conn, command, fun) do
     case GenServer.call(conn, {:stream, command}, :infinity) do
       {:ok, conn, unlock_ref, stream_ref, rows_affected} ->
+        # The unlock names the stream so that this process holds a reference
+        # to it until the callback returns. A callback such as query_pointer's
+        # may hand the raw pointer to a NIF and drop the reference; if this
+        # process is then killed inside that NIF, its heap, and so the stream,
+        # stays alive until the NIF returns, instead of the stream being
+        # garbage collected and released under the read.
         try do
           fun.(conn, stream_ref, normalize_rows(rows_affected))
         after
-          GenServer.cast(conn, {:unlock, unlock_ref})
+          GenServer.cast(conn, {:unlock, unlock_ref, stream_ref})
         end
 
       {:error, reason} ->
@@ -920,7 +926,7 @@ defmodule Adbc.Connection do
   end
 
   @impl true
-  def handle_cast({:unlock, ref}, %{lock: {ref, stream_ref}} = state) do
+  def handle_cast({:unlock, ref, stream_ref}, %{lock: {ref, stream_ref}} = state) do
     # We could let the GC be the one release it but,
     # since a stream can be a large resource, we release
     # it now and let the GC free the remaining resources.
