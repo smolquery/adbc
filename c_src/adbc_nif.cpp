@@ -2,6 +2,7 @@
 #include <cstdbool>
 #include <cstdio>
 #include <fine.hpp>
+#include <memory>
 #include <mutex>
 #include <nanoarrow/nanoarrow.h>
 #include <nanoarrow/nanoarrow_ipc.h>
@@ -9,6 +10,7 @@
 #include <stdexcept>
 
 #include "from_arrow.hpp"
+#include "releaser.hpp"
 #include "shared.hpp"
 #include "to_arrow.hpp"
 
@@ -17,13 +19,30 @@ namespace adbc_nif {
 FINE_RESOURCE(ArrowArrayStreamRecord);
 
 // Fine resource wrappers
+//
+// Each destructor hands its release to `Releaser`, because a destructor
+// runs on a BEAM scheduler and a driver may block in a release (see
+// releaser.hpp). The job takes the handle and the parent resource with it,
+// so the parent outlives the release.
+
+static void release_error(struct AdbcError *adbc_error) {
+  if (adbc_error->release != nullptr) {
+    adbc_error->release(adbc_error);
+  }
+}
 
 struct AdbcDatabaseResource {
   struct AdbcDatabase value{};
 
   void destructor(ErlNifEnv *env) {
-    struct AdbcError adbc_error{};
-    AdbcDatabaseRelease(&value, &adbc_error);
+    struct AdbcDatabase database = value;
+    value = AdbcDatabase{};
+
+    Releaser::run([database]() mutable {
+      struct AdbcError adbc_error{};
+      AdbcDatabaseRelease(&database, &adbc_error);
+      release_error(&adbc_error);
+    });
   }
 };
 FINE_RESOURCE(AdbcDatabaseResource);
@@ -33,8 +52,15 @@ struct AdbcConnectionResource {
   fine::ResourcePtr<AdbcDatabaseResource> database;
 
   void destructor(ErlNifEnv *env) {
-    struct AdbcError adbc_error{};
-    AdbcConnectionRelease(&value, &adbc_error);
+    struct AdbcConnection connection = value;
+    value = AdbcConnection{};
+
+    Releaser::run(
+        [connection, database = std::move(database)]() mutable {
+          struct AdbcError adbc_error{};
+          AdbcConnectionRelease(&connection, &adbc_error);
+          release_error(&adbc_error);
+        });
   }
 };
 FINE_RESOURCE(AdbcConnectionResource);
@@ -44,8 +70,15 @@ struct AdbcStatementResource {
   fine::ResourcePtr<AdbcConnectionResource> connection;
 
   void destructor(ErlNifEnv *env) {
-    struct AdbcError adbc_error{};
-    AdbcStatementRelease(&value, &adbc_error);
+    struct AdbcStatement statement = value;
+    value = AdbcStatement{};
+
+    Releaser::run(
+        [statement, connection = std::move(connection)]() mutable {
+          struct AdbcError adbc_error{};
+          AdbcStatementRelease(&statement, &adbc_error);
+          release_error(&adbc_error);
+        });
   }
 };
 FINE_RESOURCE(AdbcStatementResource);
@@ -61,6 +94,28 @@ struct ArrowArrayStreamResource {
   // killed while it is inside a dirty NIF, and the connection then releases
   // the stream from another scheduler while the read is still running.
   std::mutex mutex;
+
+  // No reader holds the resource once its destructor runs, so the mutex is
+  // not needed. The job releases the stream, then the schema, and only then
+  // drops its reference to the statement.
+  void destructor(ErlNifEnv *env) {
+    struct Parts {
+      fine::ResourcePtr<AdbcStatementResource> statement;
+      nanoarrow::UniqueArrayStream stream;
+      nanoarrow::UniqueSchema schema;
+    };
+
+    auto parts = std::make_shared<Parts>();
+    parts->statement = std::move(statement);
+    parts->stream = std::move(stream);
+    parts->schema = std::move(schema);
+
+    Releaser::run([parts]() {
+      parts->stream.reset();
+      parts->schema.reset();
+      parts->statement = fine::ResourcePtr<AdbcStatementResource>();
+    });
+  }
 };
 FINE_RESOURCE(ArrowArrayStreamResource);
 
