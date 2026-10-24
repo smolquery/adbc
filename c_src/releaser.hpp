@@ -21,15 +21,34 @@ namespace adbc_nif {
 // every process and timer the scheduler holds. Destructors hand their
 // release to `Releaser::run` instead.
 //
-// A worker thread starts whenever a job arrives and no worker is free, so
-// a release stuck behind a long query never holds up another one. A worker
-// left idle for a while exits. A job keeps the resources its release
-// depends on referenced until it has run, which keeps a statement released
-// before its connection, and a connection before its database.
+// A worker thread starts whenever a job arrives and no worker is free, up
+// to `max_workers`; past that, jobs wait in the queue for the next free
+// worker. So a release stuck behind a long query does not hold up another
+// one unless that many are stuck at once. A worker left idle for a while
+// exits. A job keeps the resources its release depends on referenced until
+// it has run, which keeps a statement released before its connection, and
+// a connection before its database.
+//
+// If a job cannot be queued or no worker can start, the release runs
+// inline, on the calling scheduler, as every release did before: a
+// destructor must not throw.
+//
+// Workers are not joined, so unloading the NIF library while one is alive
+// would unmap code it still runs. The library is never unloaded in a
+// release, which loads it once per VM.
 class Releaser {
 public:
-  static void run(std::function<void()> job) {
-    instance().push(std::move(job));
+  template <typename F> static void run(F release) {
+    std::function<void()> job;
+
+    try {
+      job = std::function<void()>(release);
+    } catch (...) {
+      run_inline(release);
+      return;
+    }
+
+    instance().push(job);
   }
 
 private:
@@ -40,33 +59,45 @@ private:
     return *releaser;
   }
 
-  // If no worker can be started, the job runs here, as a release did
-  // before: a destructor must not throw.
-  void push(std::function<void()> job) {
+  template <typename F> static void run_inline(F &release) {
+    try {
+      release();
+    } catch (...) {
+    }
+  }
+
+  void push(std::function<void()> &job) {
     std::unique_lock<std::mutex> lock(mutex);
 
-    if (waiting > jobs.size()) {
+    try {
       jobs.push_back(std::move(job));
+    } catch (...) {
+      lock.unlock();
+      run_inline(job);
+      return;
+    }
+
+    if (waiting >= jobs.size()) {
       ready.notify_one();
       return;
     }
 
-    try {
-      jobs.push_back(std::move(job));
-      std::thread([this] { work(); }).detach();
-    } catch (...) {
-      if (jobs.empty()) {
-        return;
-      }
-
-      auto inline_job = std::move(jobs.back());
-      jobs.pop_back();
-      lock.unlock();
-
+    if (workers < max_workers) {
       try {
-        inline_job();
+        std::thread([this] { work(); }).detach();
+        workers++;
+        return;
       } catch (...) {
       }
+    }
+
+    if (workers == 0) {
+      auto own = std::move(jobs.back());
+      jobs.pop_back();
+      lock.unlock();
+      run_inline(own);
+    } else if (waiting > 0) {
+      ready.notify_one();
     }
   }
 
@@ -81,6 +112,7 @@ private:
         waiting--;
 
         if (!woken) {
+          workers--;
           return;
         }
       }
@@ -99,12 +131,14 @@ private:
     }
   }
 
+  static constexpr size_t max_workers = 16;
   static constexpr std::chrono::seconds idle_timeout{30};
 
   std::mutex mutex;
   std::condition_variable ready;
   std::deque<std::function<void()>> jobs;
   size_t waiting = 0;
+  size_t workers = 0;
 };
 
 } // namespace adbc_nif

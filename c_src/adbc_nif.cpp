@@ -35,6 +35,10 @@ struct AdbcDatabaseResource {
   struct AdbcDatabase value{};
 
   void destructor(ErlNifEnv *env) {
+    if (value.private_data == nullptr) {
+      return;
+    }
+
     struct AdbcDatabase database = value;
     value = AdbcDatabase{};
 
@@ -52,6 +56,10 @@ struct AdbcConnectionResource {
   fine::ResourcePtr<AdbcDatabaseResource> database;
 
   void destructor(ErlNifEnv *env) {
+    if (value.private_data == nullptr) {
+      return;
+    }
+
     struct AdbcConnection connection = value;
     value = AdbcConnection{};
 
@@ -70,6 +78,10 @@ struct AdbcStatementResource {
   fine::ResourcePtr<AdbcConnectionResource> connection;
 
   void destructor(ErlNifEnv *env) {
+    if (value.private_data == nullptr) {
+      return;
+    }
+
     struct AdbcStatement statement = value;
     value = AdbcStatement{};
 
@@ -84,9 +96,12 @@ struct AdbcStatementResource {
 FINE_RESOURCE(AdbcStatementResource);
 
 struct ArrowArrayStreamResource {
-  // Keeps the statement alive while reading. Declared first so that it is
+  // Keep the connection alive while reading: a statement's stream through
+  // its statement, a metadata stream (get_info, get_objects,
+  // get_table_types) through `connection`. Declared first so that they are
   // destroyed last: members are destroyed in reverse order, and the stream
   // must be released while the statement and its connection still exist.
+  fine::ResourcePtr<AdbcConnectionResource> connection;
   fine::ResourcePtr<AdbcStatementResource> statement;
   nanoarrow::UniqueArrayStream stream;
   nanoarrow::UniqueSchema schema;
@@ -97,15 +112,27 @@ struct ArrowArrayStreamResource {
 
   // No reader holds the resource once its destructor runs, so the mutex is
   // not needed. The job releases the stream, then the schema, and only then
-  // drops its reference to the statement.
+  // drops its references to the statement and the connection. If the job
+  // cannot be allocated, the stream is released here, as before.
   void destructor(ErlNifEnv *env) {
     struct Parts {
+      fine::ResourcePtr<AdbcConnectionResource> connection;
       fine::ResourcePtr<AdbcStatementResource> statement;
       nanoarrow::UniqueArrayStream stream;
       nanoarrow::UniqueSchema schema;
     };
 
-    auto parts = std::make_shared<Parts>();
+    std::shared_ptr<Parts> parts;
+
+    try {
+      parts = std::make_shared<Parts>();
+    } catch (...) {
+      stream.reset();
+      schema.reset();
+      return;
+    }
+
+    parts->connection = std::move(connection);
     parts->statement = std::move(statement);
     parts->stream = std::move(stream);
     parts->schema = std::move(schema);
@@ -114,6 +141,7 @@ struct ArrowArrayStreamResource {
       parts->stream.reset();
       parts->schema.reset();
       parts->statement = fine::ResourcePtr<AdbcStatementResource>();
+      parts->connection = fine::ResourcePtr<AdbcConnectionResource>();
     });
   }
 };
@@ -368,6 +396,7 @@ adbc_connection_get_info(ErlNifEnv *env,
     ptr = info_codes_u32.data();
   }
   struct AdbcError adbc_error{};
+  stream_res->connection = conn;
   auto code = AdbcConnectionGetInfo(&conn->value, ptr, info_codes_length,
                                     stream_res->stream.get(), &adbc_error);
   if (code != ADBC_STATUS_OK) {
@@ -403,6 +432,7 @@ adbc_connection_get_objects(
 
   auto stream_res = fine::make_resource<ArrowArrayStreamResource>();
   struct AdbcError adbc_error{};
+  stream_res->connection = conn;
   auto code = AdbcConnectionGetObjects(
       &conn->value, (int)depth, catalog_p, db_schema_p, table_name_p,
       table_types.data(), column_name_p, stream_res->stream.get(), &adbc_error);
@@ -418,6 +448,7 @@ adbc_connection_get_table_types(
     ErlNifEnv *env, fine::ResourcePtr<AdbcConnectionResource> conn) {
   auto stream_res = fine::make_resource<ArrowArrayStreamResource>();
   struct AdbcError adbc_error{};
+  stream_res->connection = conn;
   auto code = AdbcConnectionGetTableTypes(
       &conn->value, stream_res->stream.get(), &adbc_error);
   if (code != ADBC_STATUS_OK) {
