@@ -339,4 +339,75 @@ defmodule Adbc.DuckDBTest do
       end
     end
   end
+
+  # DuckDB 2.0 takes a connection's lock to release a statement it prepared
+  # (ClientContext::RemovePreparedStatement); 1.5 did not. A query holds that
+  # lock while it binds, and opening a FIFO for reading blocks until a writer
+  # opens it, so a query reading one holds the lock until the test writes to
+  # it. A peer with a single normal scheduler then stops answering if the
+  # release of an executed statement waits for that lock on the scheduler.
+  @tag :tmp_dir
+  @tag timeout: 180_000
+  test "a statement released while its connection holds its lock does not block a scheduler",
+       %{tmp_dir: tmp_dir} do
+    fifo = Path.join(tmp_dir, "rows.csv")
+    {_, 0} = System.cmd("mkfifo", [fifo])
+
+    {:ok, peer, _node} =
+      :peer.start_link(%{
+        connection: :standard_io,
+        args: [~c"+S", ~c"1:1" | Enum.flat_map(:code.get_path(), &[~c"-pa", &1])]
+      })
+
+    setup = """
+    {:ok, _} = Application.ensure_all_started(:adbc)
+    :ok = Adbc.download_driver(:duckdb, version: "2.0.0", url: #{inspect(duckdb_2_url())})
+    {:ok, db} = Adbc.Database.start_link(driver: :duckdb, version: "2.0.0")
+    Process.unlink(db)
+    {:ok, conn} = Adbc.Connection.start_link(database: db)
+    Process.unlink(conn)
+    test = self()
+
+    holder =
+      spawn(fn ->
+        {:ok, %Adbc.StreamResult{ref: stream}} =
+          Adbc.Connection.query_pointer(conn, "SELECT $1::INTEGER AS x", [42], & &1)
+
+        send(test, :executed)
+        receive do: (:drop -> stream)
+      end)
+
+    receive do: (:executed -> :ok)
+    _ = Adbc.Connection.cancel_handle(conn)
+    :erlang.garbage_collect(conn)
+    spawn(fn -> Adbc.Connection.query(conn, "SELECT * FROM read_csv('#{fifo}')") end)
+    Process.sleep(500)
+    send(holder, :drop)
+    :ok
+    """
+
+    try do
+      assert {:ok, _binding} = :peer.call(peer, Code, :eval_string, [setup], 120_000)
+
+      for _round <- 1..5 do
+        Process.sleep(200)
+        assert :peer.call(peer, :erlang, :node, [], 2_000) == :nonode@nohost
+      end
+    after
+      {:ok, writer} = File.open(fifo, [:read, :write])
+      IO.binwrite(writer, "a\n1\n")
+      File.close(writer)
+      :peer.stop(peer)
+    end
+  end
+
+  defp duckdb_2_url do
+    base = "https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-shared-libs-"
+
+    case {:os.type(), :erlang.system_info(:system_architecture) |> to_string()} do
+      {{:unix, :darwin}, _arch} -> base <> "osx-universal.tar.gz"
+      {{:unix, :linux}, "aarch64" <> _} -> base <> "linux-arm64.tar.gz"
+      {{:unix, :linux}, _arch} -> base <> "linux-amd64.tar.gz"
+    end
+  end
 end
