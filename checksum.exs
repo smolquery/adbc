@@ -1,7 +1,7 @@
 %{
-  "adbc-nif-2.17-aarch64-apple-darwin-0.12.2-smolquery.4.tar.gz" => "sha256:772f62e6e3762cf5d513d54352be0cf7337d871d4b862a47f9025a0fff0f6366",
-  "adbc-nif-2.17-aarch64-linux-gnu-0.12.2-smolquery.4.tar.gz" => "sha256:bb517919b4aa1a55f71cb717c732a3d987a9330e6ba205a6317399f947cd88c8",
-  "adbc-nif-2.17-x86_64-apple-darwin-0.12.2-smolquery.4.tar.gz" => "sha256:82fd11c423a956d0624cde846df57f14b061437d36233ce9dca1da0c7c4e088b",
-  "adbc-nif-2.17-x86_64-linux-gnu-0.12.2-smolquery.4.tar.gz" => "sha256:d66d9a4c50b830f0f1692d22c53c0ede1bd5452f614017e082c84f640935c389",
-  "adbc-nif-2.17-x86_64-windows-msvc-0.12.2-smolquery.4.tar.gz" => "sha256:90bfd455a161804fec962098b9490c823f374bae46d6965f027ca38b92359c02",
+  "adbc-nif-2.17-aarch64-apple-darwin-0.12.2-smolquery.5.tar.gz" => "sha256:355ce61c385cdae0f9827a172c0cb43effc64792f6c5fb7b220b711aa6547ae7",
+  "adbc-nif-2.17-aarch64-linux-gnu-0.12.2-smolquery.5.tar.gz" => "sha256:0a16482ca4807a2d2373ae571fbfd58a5d8c6a6fda86fd8080046ac6c7d0a6de",
+  "adbc-nif-2.17-x86_64-apple-darwin-0.12.2-smolquery.5.tar.gz" => "sha256:ca773e426c8616fb155a963034d2de82f8560f54368e1ef727fb5192b76e3c41",
+  "adbc-nif-2.17-x86_64-linux-gnu-0.12.2-smolquery.5.tar.gz" => "sha256:a3265ef1a4c04a7192761e12c843efa6d2391c780fbcbdc2f06bbd6470773c21",
+  "adbc-nif-2.17-x86_64-windows-msvc-0.12.2-smolquery.5.tar.gz" => "sha256:3cb0c613ad7d2bea919260adaec320513ea8a3735e4bad5eb12846073a48a720",
 }
