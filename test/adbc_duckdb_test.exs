@@ -401,6 +401,45 @@ defmodule Adbc.DuckDBTest do
     end
   end
 
+  # DuckDB checkpoints a file database when it closes and then deletes its
+  # write-ahead log, so a log left behind means the close was cut short. The
+  # database, its connection and their statements are stopped just before
+  # the peer halts, and their releases run on the releaser's workers.
+  @tag :tmp_dir
+  @tag timeout: 180_000
+  test "a database stopped just before the VM halts finishes closing", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "halt.duckdb")
+
+    {:ok, peer, _node} =
+      :peer.start_link(%{
+        connection: :standard_io,
+        args: Enum.flat_map(:code.get_path(), &[~c"-pa", &1])
+      })
+
+    setup = """
+    {:ok, _} = Application.ensure_all_started(:adbc)
+    :ok = Adbc.download_driver(:duckdb, version: "2.0.0", url: #{inspect(duckdb_2_url())})
+    {:ok, db} = Adbc.Database.start_link(driver: :duckdb, version: "2.0.0", path: #{inspect(path)})
+    Process.unlink(db)
+    {:ok, conn} = Adbc.Connection.start_link(database: db)
+    Process.unlink(conn)
+    {:ok, _} = Adbc.Connection.query(conn, "SET checkpoint_threshold = '10GB'")
+    {:ok, _} = Adbc.Connection.query(conn, "CREATE TABLE t AS SELECT range AS x FROM range(1000000)")
+    {:ok, _} = Adbc.Connection.query(conn, "SELECT $1::INTEGER AS x", [42])
+    GenServer.stop(conn)
+    GenServer.stop(db)
+    :ok
+    """
+
+    ref = Process.monitor(peer)
+    assert {:ok, _binding} = :peer.call(peer, Code, :eval_string, [setup], 120_000)
+    :peer.cast(peer, System, :halt, [0])
+    assert_receive {:DOWN, ^ref, :process, ^peer, _reason}, 60_000
+
+    assert File.exists?(path)
+    refute File.exists?(path <> ".wal")
+  end
+
   defp duckdb_2_url do
     base = "https://github.com/duckdb/duckdb/releases/download/v2.0.0/duckdb-shared-libs-"
 

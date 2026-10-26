@@ -25,30 +25,51 @@ namespace adbc_nif {
 // to `max_workers`; past that, jobs wait in the queue for the next free
 // worker. So a release stuck behind a long query does not hold up another
 // one unless that many are stuck at once. A worker left idle for a while
-// exits. A job keeps the resources its release depends on referenced until
-// it has run, which keeps a statement released before its connection, and
-// a connection before its database.
+// exits. What a release depends on travels with its job: a statement's
+// job holds its connection, so the job that lets go of the last holder
+// of a chain releases all of it, in order (see adbc_nif.cpp).
 //
 // If a job cannot be queued or no worker can start, the release runs
 // inline, on the calling scheduler, as every release did before: a
-// destructor must not throw.
+// destructor must not throw. A job is moved, never copied, into the queue,
+// so the caller is never left holding the last reference to what it
+// releases once a worker has run it.
+//
+// A release that is queued or running when the VM halts would otherwise be
+// cut short by exit(): a database stopped just before halt would not finish
+// closing, and its release would run on while exit() destroys the driver's
+// static objects. The NIF library's on-halt callback calls `drain`, which
+// waits for the queue to empty, up to `halt_timeout`, before the VM exits.
 //
 // Workers are not joined, so unloading the NIF library while one is alive
 // would unmap code it still runs. The library is never unloaded in a
 // release, which loads it once per VM.
 class Releaser {
 public:
+  static constexpr std::chrono::seconds halt_timeout{30};
+
   template <typename F> static void run(F release) {
     std::function<void()> job;
 
     try {
-      job = std::function<void()>(release);
+      job = std::function<void()>(std::move(release));
     } catch (...) {
       run_inline(release);
       return;
     }
 
     instance().push(job);
+  }
+
+  // Waits until no release is queued or running, or `timeout` passes.
+  // Returns whether every release finished.
+  static bool drain(std::chrono::milliseconds timeout) {
+    auto &releaser = instance();
+    std::unique_lock<std::mutex> lock(releaser.mutex);
+
+    return releaser.idle.wait_for(lock, timeout, [&releaser] {
+      return releaser.jobs.empty() && releaser.running == 0;
+    });
   }
 
 private:
@@ -119,6 +140,7 @@ private:
 
       auto job = std::move(jobs.front());
       jobs.pop_front();
+      running++;
       lock.unlock();
 
       try {
@@ -128,6 +150,11 @@ private:
 
       job = nullptr;
       lock.lock();
+      running--;
+
+      if (jobs.empty() && running == 0) {
+        idle.notify_all();
+      }
     }
   }
 
@@ -136,9 +163,11 @@ private:
 
   std::mutex mutex;
   std::condition_variable ready;
+  std::condition_variable idle;
   std::deque<std::function<void()>> jobs;
   size_t waiting = 0;
   size_t workers = 0;
+  size_t running = 0;
 };
 
 } // namespace adbc_nif

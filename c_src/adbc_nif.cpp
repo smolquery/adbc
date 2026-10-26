@@ -20,10 +20,19 @@ FINE_RESOURCE(ArrowArrayStreamRecord);
 
 // Fine resource wrappers
 //
-// Each destructor hands its release to `Releaser`, because a destructor
-// runs on a BEAM scheduler and a driver may block in a release (see
-// releaser.hpp). The job takes the handle and the parent resource with it,
-// so the parent outlives the release.
+// A resource's ADBC handle lives in an owner that the resource shares with
+// the resources that depend on it: a connection's owner holds its
+// database's owner, a statement's owner its connection's, and a stream
+// holds the owners it reads through. The owner releases the handle when the
+// last of them lets go, so a statement is released before its connection,
+// and a connection before its database. The resource's `value` refers to
+// the handle inside its owner, so the handle keeps its address for as long
+// as anything holds it.
+//
+// Owners are let go on a `Releaser` worker, never on a BEAM scheduler,
+// because a driver may block in a release (see releaser.hpp). The worker
+// that lets go of the last owner of a chain releases the whole chain in the
+// same job, without waiting on the VM to run another resource's destructor.
 
 static void release_error(struct AdbcError *adbc_error) {
   if (adbc_error->release != nullptr) {
@@ -31,78 +40,80 @@ static void release_error(struct AdbcError *adbc_error) {
   }
 }
 
-struct AdbcDatabaseResource {
+template <typename Owner> static void let_go(std::shared_ptr<Owner> owner) {
+  Releaser::run([owner = std::move(owner)]() mutable { owner.reset(); });
+}
+
+struct DatabaseOwner {
   struct AdbcDatabase value{};
 
-  void destructor(ErlNifEnv *env) {
-    if (value.private_data == nullptr) {
-      return;
-    }
-
-    struct AdbcDatabase database = value;
-    value = AdbcDatabase{};
-
-    Releaser::run([database]() mutable {
+  ~DatabaseOwner() {
+    if (value.private_data != nullptr) {
       struct AdbcError adbc_error{};
-      AdbcDatabaseRelease(&database, &adbc_error);
+      AdbcDatabaseRelease(&value, &adbc_error);
       release_error(&adbc_error);
-    });
+    }
   }
+};
+
+struct ConnectionOwner {
+  struct AdbcConnection value{};
+  std::shared_ptr<DatabaseOwner> database;
+
+  ~ConnectionOwner() {
+    if (value.private_data != nullptr) {
+      struct AdbcError adbc_error{};
+      AdbcConnectionRelease(&value, &adbc_error);
+      release_error(&adbc_error);
+    }
+  }
+};
+
+struct StatementOwner {
+  struct AdbcStatement value{};
+  std::shared_ptr<ConnectionOwner> connection;
+
+  ~StatementOwner() {
+    if (value.private_data != nullptr) {
+      struct AdbcError adbc_error{};
+      AdbcStatementRelease(&value, &adbc_error);
+      release_error(&adbc_error);
+    }
+  }
+};
+
+struct AdbcDatabaseResource {
+  std::shared_ptr<DatabaseOwner> owner = std::make_shared<DatabaseOwner>();
+  struct AdbcDatabase &value = owner->value;
+
+  void destructor(ErlNifEnv *env) { let_go(std::move(owner)); }
 };
 FINE_RESOURCE(AdbcDatabaseResource);
 
 struct AdbcConnectionResource {
-  struct AdbcConnection value{};
-  fine::ResourcePtr<AdbcDatabaseResource> database;
+  std::shared_ptr<ConnectionOwner> owner = std::make_shared<ConnectionOwner>();
+  struct AdbcConnection &value = owner->value;
 
-  void destructor(ErlNifEnv *env) {
-    if (value.private_data == nullptr) {
-      return;
-    }
-
-    struct AdbcConnection connection = value;
-    value = AdbcConnection{};
-
-    Releaser::run(
-        [connection, database = std::move(database)]() mutable {
-          struct AdbcError adbc_error{};
-          AdbcConnectionRelease(&connection, &adbc_error);
-          release_error(&adbc_error);
-        });
-  }
+  void destructor(ErlNifEnv *env) { let_go(std::move(owner)); }
 };
 FINE_RESOURCE(AdbcConnectionResource);
 
 struct AdbcStatementResource {
-  struct AdbcStatement value{};
-  fine::ResourcePtr<AdbcConnectionResource> connection;
+  std::shared_ptr<StatementOwner> owner = std::make_shared<StatementOwner>();
+  struct AdbcStatement &value = owner->value;
 
-  void destructor(ErlNifEnv *env) {
-    if (value.private_data == nullptr) {
-      return;
-    }
-
-    struct AdbcStatement statement = value;
-    value = AdbcStatement{};
-
-    Releaser::run(
-        [statement, connection = std::move(connection)]() mutable {
-          struct AdbcError adbc_error{};
-          AdbcStatementRelease(&statement, &adbc_error);
-          release_error(&adbc_error);
-        });
-  }
+  void destructor(ErlNifEnv *env) { let_go(std::move(owner)); }
 };
 FINE_RESOURCE(AdbcStatementResource);
 
 struct ArrowArrayStreamResource {
   // Keep the connection alive while reading: a statement's stream through
-  // its statement, a metadata stream (get_info, get_objects,
+  // its statement's owner, a metadata stream (get_info, get_objects,
   // get_table_types) through `connection`. Declared first so that they are
   // destroyed last: members are destroyed in reverse order, and the stream
   // must be released while the statement and its connection still exist.
-  fine::ResourcePtr<AdbcConnectionResource> connection;
-  fine::ResourcePtr<AdbcStatementResource> statement;
+  std::shared_ptr<ConnectionOwner> connection;
+  std::shared_ptr<StatementOwner> statement;
   nanoarrow::UniqueArrayStream stream;
   nanoarrow::UniqueSchema schema;
   // Serializes reads against release. The process reading a stream may be
@@ -112,12 +123,12 @@ struct ArrowArrayStreamResource {
 
   // No reader holds the resource once its destructor runs, so the mutex is
   // not needed. The job releases the stream, then the schema, and only then
-  // drops its references to the statement and the connection. If the job
-  // cannot be allocated, the stream is released here, as before.
+  // lets go of the statement and the connection. If the job cannot be
+  // allocated, all of it is released here, as before.
   void destructor(ErlNifEnv *env) {
     struct Parts {
-      fine::ResourcePtr<AdbcConnectionResource> connection;
-      fine::ResourcePtr<AdbcStatementResource> statement;
+      std::shared_ptr<ConnectionOwner> connection;
+      std::shared_ptr<StatementOwner> statement;
       nanoarrow::UniqueArrayStream stream;
       nanoarrow::UniqueSchema schema;
     };
@@ -137,11 +148,10 @@ struct ArrowArrayStreamResource {
     parts->stream = std::move(stream);
     parts->schema = std::move(schema);
 
-    Releaser::run([parts]() {
+    Releaser::run([parts = std::move(parts)]() mutable {
       parts->stream.reset();
       parts->schema.reset();
-      parts->statement = fine::ResourcePtr<AdbcStatementResource>();
-      parts->connection = fine::ResourcePtr<AdbcConnectionResource>();
+      parts.reset();
     });
   }
 };
@@ -379,7 +389,7 @@ adbc_connection_init(ErlNifEnv *env,
   if (code != ADBC_STATUS_OK) {
     return fine::Error(ExAdbcError(&adbc_error));
   }
-  conn->database = db;
+  conn->owner->database = db->owner;
   return fine::Ok<>();
 }
 FINE_NIF(adbc_connection_init, ERL_NIF_DIRTY_JOB_IO_BOUND);
@@ -396,7 +406,7 @@ adbc_connection_get_info(ErlNifEnv *env,
     ptr = info_codes_u32.data();
   }
   struct AdbcError adbc_error{};
-  stream_res->connection = conn;
+  stream_res->connection = conn->owner;
   auto code = AdbcConnectionGetInfo(&conn->value, ptr, info_codes_length,
                                     stream_res->stream.get(), &adbc_error);
   if (code != ADBC_STATUS_OK) {
@@ -432,7 +442,7 @@ adbc_connection_get_objects(
 
   auto stream_res = fine::make_resource<ArrowArrayStreamResource>();
   struct AdbcError adbc_error{};
-  stream_res->connection = conn;
+  stream_res->connection = conn->owner;
   auto code = AdbcConnectionGetObjects(
       &conn->value, (int)depth, catalog_p, db_schema_p, table_name_p,
       table_types.data(), column_name_p, stream_res->stream.get(), &adbc_error);
@@ -448,7 +458,7 @@ adbc_connection_get_table_types(
     ErlNifEnv *env, fine::ResourcePtr<AdbcConnectionResource> conn) {
   auto stream_res = fine::make_resource<ArrowArrayStreamResource>();
   struct AdbcError adbc_error{};
-  stream_res->connection = conn;
+  stream_res->connection = conn->owner;
   auto code = AdbcConnectionGetTableTypes(
       &conn->value, stream_res->stream.get(), &adbc_error);
   if (code != ADBC_STATUS_OK) {
@@ -467,7 +477,7 @@ adbc_statement_new(ErlNifEnv *env,
   if (code != ADBC_STATUS_OK) {
     return fine::Error(ExAdbcError(&adbc_error));
   }
-  stmt->connection = conn;
+  stmt->owner->connection = conn->owner;
   return fine::Ok(stmt);
 }
 FINE_NIF(adbc_statement_new, 0);
@@ -504,7 +514,7 @@ adbc_statement_execute_query(ErlNifEnv *env,
   if (code != ADBC_STATUS_OK) {
     return fine::Error(ExAdbcError(&adbc_error));
   }
-  stream_res->statement = stmt;
+  stream_res->statement = stmt->owner;
   return fine::Ok(stream_res, rows_affected);
 }
 FINE_NIF(adbc_statement_execute_query, ERL_NIF_DIRTY_JOB_IO_BOUND);
@@ -747,6 +757,44 @@ adbc_execute_on_gc_new(ErlNifEnv *env, ErlNifPid pid, std::string statement) {
 }
 FINE_NIF(adbc_execute_on_gc_new, 0);
 
+void drain_releases_on_halt(void *) { Releaser::drain(Releaser::halt_timeout); }
+
+// fine's load callback, plus the on-halt callback that lets queued releases
+// finish before the VM exits. The VM only takes that callback at load.
+int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
+  if (fine::__private__::load(env, priv_data, load_info) != 0) {
+    return -1;
+  }
+
+  if (enif_set_option(env, ERL_NIF_OPT_ON_HALT, drain_releases_on_halt) != 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
 } // namespace adbc_nif
 
-FINE_INIT("Elixir.Adbc.Nif");
+// FINE_INIT, with adbc_nif::load as the load callback.
+ERL_NIF_INIT_PROLOGUE
+ERL_NIF_INIT_GLOB
+ERL_NIF_INIT_DECL(NAME);
+ERL_NIF_INIT_DECL(NAME) {
+  auto &nif_funcs = fine::__private__::get_erl_nif_funcs();
+  static ErlNifEntry entry = {ERL_NIF_MAJOR_VERSION,
+                              ERL_NIF_MINOR_VERSION,
+                              "Elixir.Adbc.Nif",
+                              static_cast<int>(nif_funcs.size()),
+                              nif_funcs.data(),
+                              adbc_nif::load,
+                              NULL,
+                              NULL,
+                              NULL,
+                              ERL_NIF_VM_VARIANT,
+                              1,
+                              sizeof(ErlNifResourceTypeInit),
+                              ERL_NIF_MIN_ERTS_VERSION};
+  ERL_NIF_INIT_BODY;
+  return &entry;
+}
+ERL_NIF_INIT_EPILOGUE
